@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import datetime
+import math
 
 # --- Constants & Dimensions ---
 # Total Storage Dimensions (from layout)
@@ -90,7 +91,7 @@ class WarehouseGUI:
         self.dock_rects = {} # ID -> name
         self.canvas_docks = {} # name -> ID
         
-        self.dashboard_tree = ttk.Treeview(self.root) 
+        self.dashboard_tree = ttk.Treeview(self.root)
         self.group_tree = ttk.Treeview(self.root)
         self.booking_result_lbl = ttk.Label(self.root)
         self.calc_output_area = tk.Text(self.root)
@@ -98,6 +99,9 @@ class WarehouseGUI:
         self.heat_grid_frame = ttk.Frame(self.root)
         self.left_frame = ttk.Frame(self.root)
         self.right_frame = ttk.Frame(self.root)
+        self.stock_left_frame = ttk.Frame(self.root)
+        self.stock_right_frame = ttk.Frame(self.root)
+        self.stock_left_legend = ttk.LabelFrame(self.root)
         self.canvas_frame = ttk.Frame(self.root)
         self.stats_panel = ttk.LabelFrame(self.root)
         self.canvas = tk.Canvas(self.root)
@@ -271,9 +275,9 @@ class WarehouseGUI:
 
             # Determine loading suffix
             loading_suffix = ""
-            for group_name, load_data in active_loadings.items():
-                if rack_num in RACK_CONFIGS[group_name]['racks']:
-                    loading_suffix = f"\n[LOADING {load_data['type']}]"
+            for g_name, l_data in active_loadings.items():
+                if rack_num in RACK_CONFIGS[g_name]['racks']:
+                    loading_suffix = f"\n[LOADING {l_data['type']}]"
                     break
 
             # Determine group class
@@ -449,7 +453,7 @@ class WarehouseGUI:
         manual_cb.pack(side=tk.LEFT, padx=2)
 
         ttk.Button(manual_frame, text="Key-In", command=self.add_manual_qty).pack(side=tk.LEFT, padx=5)
-        ttk.Button(manual_frame, text="Erase", command=self.erase_manual_qty).pack(side=tk.LEFT, padx=2)
+        ttk.Button(manual_frame, text="Erase", command=self.erase_manual).pack(side=tk.LEFT, padx=2)
 
         # Output Text Area (Further reduced height)
         self.calc_output_area = tk.Text(self.stock_right_frame, wrap=tk.WORD, height=8, width=40)
@@ -524,12 +528,24 @@ class WarehouseGUI:
                 if not messagebox.askyesno("Capacity Warning", f"Adding {qty} units exceeds {assigned_group} Max. Proceed?"):
                     return
 
-        sku_inventory[sku] += qty
-        self.update_inventory_display()
-        self.draw_rack_heatmap()
-        self.add_transaction_log(f"Manual Key-In: +{qty} to SKU-{sku}")
+            # Distribute items to racks
+            remaining = qty
+            config = RACK_CONFIGS[assigned_group]
+            max_per_rack = config['per_lvl'] * config['lvls']
+            for r_num in config['racks']:
+                if remaining <= 0: break
+                space = max_per_rack - rack_inventory[r_num]
+                to_add = min(remaining, space)
+                if to_add > 0:
+                    rack_inventory[r_num] += to_add
+                    rack_sku_counts[r_num][sku] = rack_sku_counts[r_num].get(sku, 0) + to_add
+                    remaining -= to_add
 
-    def erase_manual_qty(self):
+            sku_inventory[sku] += qty
+            self.update_inventory_display()
+            self.add_transaction_log(f"Manual Key-In: +{qty} to SKU-{sku}")
+
+    def erase_manual(self):
         sku = self.manual_sku_var.get()
         qty_str = self.manual_qty_var.get()
         if not sku or not qty_str.isdigit():
@@ -541,10 +557,29 @@ class WarehouseGUI:
             messagebox.showwarning("Inventory Error", f"Cannot erase {qty} units. Stock would become negative.")
             return
 
-        sku_inventory[sku] -= qty
-        self.update_inventory_display()
-        self.draw_rack_heatmap()
-        self.add_transaction_log(f"Manual Erase: -{qty} from SKU-{sku}")
+        # Find which group this SKU belongs to
+        assigned_group = None
+        for g_name, conf in RACK_CONFIGS.items():
+            if sku in conf['skus']:
+                assigned_group = g_name
+                break
+        
+        if assigned_group:
+            # Remove items from racks
+            remaining = qty
+            config = RACK_CONFIGS[assigned_group]
+            for r_num in reversed(list(config['racks'])):
+                if remaining <= 0: break
+                available = rack_sku_counts[r_num].get(sku, 0)
+                to_remove = min(remaining, available)
+                if to_remove > 0:
+                    rack_sku_counts[r_num][sku] -= to_remove
+                    rack_inventory[r_num] -= to_remove
+                    remaining -= to_remove
+
+            sku_inventory[sku] -= qty
+            self.update_inventory_display()
+            self.add_transaction_log(f"Manual Erase: -{qty} from SKU-{sku}")
 
     def add_sku_flow(self, sku):
         # Find which group this SKU belongs to
@@ -569,9 +604,20 @@ class WarehouseGUI:
                 f"Adding {flow_qty} units to {sku} exceeds Group {assigned_group} Max Capacity ({conf['max']}). Proceed with overflow?"):
                 return
 
+        # Distribute items to racks
+        remaining = flow_qty
+        max_per_rack = conf['per_lvl'] * conf['lvls']
+        for r_num in conf['racks']:
+            if remaining <= 0: break
+            space = max_per_rack - rack_inventory[r_num]
+            to_add = min(remaining, space)
+            if to_add > 0:
+                rack_inventory[r_num] += to_add
+                rack_sku_counts[r_num][sku] = rack_sku_counts[r_num].get(sku, 0) + to_add
+                remaining -= to_add
+
         sku_inventory[sku] += flow_qty
         self.update_inventory_display()
-        self.draw_rack_heatmap()
         self.add_transaction_log(f"Added Flow (+{flow_qty}) to SKU-{sku} (Group {assigned_group})")
 
     def remove_sku_flow(self, sku):
@@ -582,15 +628,29 @@ class WarehouseGUI:
                 assigned_group = g_name
                 break
         
+        if not assigned_group: return
+
+        # Use user-specified flow-in quantities (florin)
         flow_qty = FLOW_IN_QUANTS.get(sku, 0)
         
         if sku_inventory[sku] - flow_qty < 0:
             messagebox.showwarning("Inventory Note", f"Cannot remove {flow_qty} units from SKU-{sku}. Stock would be negative.")
             return
 
+        # Remove items from racks
+        remaining = flow_qty
+        config = RACK_CONFIGS[assigned_group]
+        for r_num in reversed(list(config['racks'])):
+            if remaining <= 0: break
+            available = rack_sku_counts[r_num].get(sku, 0)
+            to_remove = min(remaining, available)
+            if to_remove > 0:
+                rack_sku_counts[r_num][sku] -= to_remove
+                rack_inventory[r_num] -= to_remove
+                remaining -= to_remove
+
         sku_inventory[sku] -= flow_qty
         self.update_inventory_display()
-        self.draw_rack_heatmap()
         self.add_transaction_log(f"Deleted Flow (-{flow_qty}) from SKU-{sku} (Group {assigned_group})")
 
     def calculate_vehicle_booking(self):
@@ -622,7 +682,6 @@ class WarehouseGUI:
         total_cap_per_veh = floor_cap * stack_factor
 
         # 3. Reservation Requirement (Ceil)
-        import math
         req_vehicles = math.ceil(daily_qty / total_cap_per_veh) if total_cap_per_veh > 0 else 0
 
         # 4. Efficiency (Floor space utilization)
@@ -725,12 +784,15 @@ class WarehouseGUI:
                 if rack_inventory[r_num] < max_per_rack:
                     rack_inventory[r_num] += 1
                     sku_inventory[sku] += 1
+                    # Update per-rack SKU counts
+                    rack_sku_counts[r_num][sku] = rack_sku_counts[r_num].get(sku, 0) + 1
                     success = True
                     break
         else: # OUT
             # Find first rack in group that has items
             for r_num in config['racks']:
-                if rack_inventory[r_num] > 0:
+                if rack_sku_counts[r_num].get(sku, 0) > 0:
+                    rack_sku_counts[r_num][sku] -= 1
                     rack_inventory[r_num] -= 1
                     sku_inventory[sku] = max(0, sku_inventory[sku] - 1)
                     success = True
@@ -743,9 +805,9 @@ class WarehouseGUI:
             data['qty_remaining'] = 0 
         
         # Update visuals during sim
-        self.draw_warehouse_structure()
-        self.update_dock_visuals()
         self.update_inventory_display()
+        self.update_dock_visuals()
+        self.root.update_idletasks() # Force UI refresh
 
         # Schedule next unit (simulate 5s total for the whole flow? or 5s per unit? 
         # User said "add timer like maybe for sim 5 sec for each process". 
@@ -756,34 +818,39 @@ class WarehouseGUI:
 
     def update_inventory_display(self):
         # 1. Update SKU Treeview (Details)
-        for item in self.dashboard_tree.get_children():
-            self.dashboard_tree.delete(item)
-        
-        for sku in sorted(SKUS.keys()):
-            target, max_cap = 0, 0
-            for conf in RACK_CONFIGS.values():
-                if sku in conf['skus']:
-                    target, max_cap = conf['target'], conf['max']
-                    break
+        if self.dashboard_tree:
+            for item in self.dashboard_tree.get_children():
+                self.dashboard_tree.delete(item)
             
-            # Calculate Flow Count
-            flow_val = FLOW_IN_QUANTS.get(sku, 1)
-            flow_count = round(sku_inventory[sku] / flow_val, 1)
-            
-            self.dashboard_tree.insert("", tk.END, values=(sku, sku_inventory[sku], flow_count, target, max_cap))
+            for sku in sorted(SKUS.keys()):
+                target, max_cap = 0, 0
+                for conf in RACK_CONFIGS.values():
+                    if sku in conf['skus']:
+                        target, max_cap = conf['target'], conf['max']
+                        break
+                
+                # Calculate Flow Count
+                flow_val = FLOW_IN_QUANTS.get(sku, 1)
+                curr_stock = sku_inventory.get(sku, 0)
+                flow_count = round(curr_stock / flow_val, 1) if flow_val > 0 else 0
+                
+                self.dashboard_tree.insert("", tk.END, values=(sku, curr_stock, flow_count, target, max_cap))
 
         # 2. Update Group Treeview (Summary)
-        for item in self.group_tree.get_children():
-            self.group_tree.delete(item)
-        
-        for g_name, conf in RACK_CONFIGS.items():
-            actual_items = sum(sku_inventory[s] for s in conf['skus'])
-            fullness = int((actual_items / conf['max']) * 100) if conf['max'] > 0 else 0
+        if self.group_tree:
+            for item in self.group_tree.get_children():
+                self.group_tree.delete(item)
             
-            self.group_tree.insert("", tk.END, values=(g_name, actual_items, conf['target'], f"{fullness}%"))
+            for g_name, conf in RACK_CONFIGS.items():
+                actual_items = sum(sku_inventory.get(s, 0) for s in conf['skus'])
+                full_val = conf['max']
+                fullness = int((actual_items / full_val) * 100) if full_val > 0 else 0
+                
+                self.group_tree.insert("", tk.END, values=(g_name, actual_items, conf['target'], f"{fullness}%"))
 
         # 3. Refresh Layout Tab (Labels/Heatmap)
         self.draw_warehouse_structure()
+        self.draw_rack_heatmap()
 
     def calculate_sku_maxout(self):
         sku_to_calc = self.calc_sku_var.get()
